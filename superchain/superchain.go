@@ -4,11 +4,14 @@ import (
 	"compress/gzip"
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"path"
 	"reflect"
 	"strings"
+	"time"
 
 	"golang.org/x/exp/maps"
 	"golang.org/x/mod/semver"
@@ -24,7 +27,7 @@ var extraFS embed.FS
 //go:embed implementations
 var implementationsFS embed.FS
 
-//go:embed semver.yaml
+//go:embed configs/**/semver.yaml
 var semverFS embed.FS
 
 type BlockID struct {
@@ -39,6 +42,13 @@ type ChainGenesis struct {
 	ExtraData *HexBytes `yaml:"extra_data,omitempty"`
 }
 
+type HardForkConfiguration struct {
+	CanyonTime  *uint64 `yaml:"canyon_time,omitempty"`
+	DeltaTime   *uint64 `yaml:"delta_time,omitempty"`
+	EcotoneTime *uint64 `yaml:"ecotone_time,omitempty"`
+	FjordTime   *uint64 `yaml:"fjord_time,omitempty"`
+}
+
 type ChainConfig struct {
 	Name         string `yaml:"name"`
 	ChainID      uint64 `yaml:"chain_id"`
@@ -46,8 +56,7 @@ type ChainConfig struct {
 	SequencerRPC string `yaml:"sequencer_rpc"`
 	Explorer     string `yaml:"explorer"`
 
-	SystemConfigAddr Address `yaml:"system_config_addr"`
-	BatchInboxAddr   Address `yaml:"batch_inbox_addr"`
+	BatchInboxAddr Address `yaml:"batch_inbox_addr"`
 
 	Genesis ChainGenesis `yaml:"genesis"`
 
@@ -57,6 +66,32 @@ type ChainConfig struct {
 	// Chain is a simple string to identify the chain, within its superchain context.
 	// This matches the resource filename, it is not encoded in the config file itself.
 	Chain string `yaml:"-"`
+
+	// Hardfork Configuration Overrides
+	HardForkConfiguration `yaml:",inline"`
+}
+
+// setNilHardforkTimestampsToDefault overwrites each unspecified hardfork activation time override
+// with the superchain default.
+func (c *ChainConfig) setNilHardforkTimestampsToDefault(s *SuperchainConfig) {
+	cVal := reflect.ValueOf(&c.HardForkConfiguration).Elem()
+	sVal := reflect.ValueOf(&s.hardForkDefaults).Elem()
+
+	for i := 0; i < reflect.Indirect(cVal).NumField(); i++ {
+		overrideValue := cVal.Field(i)
+		if overrideValue.IsNil() {
+			defaultValue := sVal.Field(i)
+			overrideValue.Set(defaultValue)
+		}
+	}
+
+	// This achieves:
+	//
+	// if c.CanyonTime == nil {
+	// 	c.CanyonTime = s.Config.hardForkDefaults.CanyonTime
+	// }
+	//
+	// ...etc for each field in HardForkConfiguration
 }
 
 // AddressList represents the set of network specific contracts for a given network.
@@ -68,7 +103,38 @@ type AddressList struct {
 	L2OutputOracleProxy               Address `json:"L2OutputOracleProxy"`
 	OptimismMintableERC20FactoryProxy Address `json:"OptimismMintableERC20FactoryProxy"`
 	OptimismPortalProxy               Address `json:"OptimismPortalProxy"`
+	SystemConfigProxy                 Address `json:"SystemConfigProxy"`
 	ProxyAdmin                        Address `json:"ProxyAdmin"`
+}
+
+// AddressFor returns a nonzero address for the supplied contract name, if it has been specified
+// (and an error otherwise). Useful for slicing into the struct using a string.
+func (a AddressList) AddressFor(contractName string) (Address, error) {
+	var address Address
+	switch contractName {
+	case "ProxyAdmin":
+		address = a.ProxyAdmin
+	case "L1CrossDomainMessengerProxy":
+		address = a.L1CrossDomainMessengerProxy
+	case "L1ERC721BridgeProxy":
+		address = a.L1ERC721BridgeProxy
+	case "L1StandardBridgeProxy":
+		address = a.L1StandardBridgeProxy
+	case "L2OutputOracleProxy":
+		address = a.L2OutputOracleProxy
+	case "OptimismMintableERC20FactoryProxy":
+		address = a.OptimismMintableERC20FactoryProxy
+	case "OptimismPortalProxy":
+		address = a.OptimismPortalProxy
+	case "SystemConfigProxy":
+		address = a.SystemConfigProxy
+	default:
+		return address, errors.New("no such contract name")
+	}
+	if address == (Address{}) {
+		return address, errors.New("no address or zero address specified")
+	}
+	return address, nil
 }
 
 // ImplementationList represents the set of implementation contracts to be used together
@@ -199,11 +265,46 @@ type ContractVersions struct {
 	OptimismMintableERC20Factory string `yaml:"optimism_mintable_erc20_factory"`
 	OptimismPortal               string `yaml:"optimism_portal"`
 	SystemConfig                 string `yaml:"system_config"`
+	// Superchain-wide contracts:
+	ProtocolVersions string `yaml:"protocol_versions"`
+	SuperchainConfig string `yaml:"superchain_config,omitempty"`
+}
+
+// VersionFor returns the version for the supplied contract name, if it exits
+// (and an error otherwise). Useful for slicing into the struct using a string.
+func (c ContractVersions) VersionFor(contractName string) (string, error) {
+	var version string
+	switch contractName {
+	case "L1CrossDomainMessenger":
+		version = c.L1CrossDomainMessenger
+	case "L1ERC721Bridge":
+		version = c.L1ERC721Bridge
+	case "L1StandardBridge":
+		version = c.L1StandardBridge
+	case "L2OutputOracle":
+		version = c.L2OutputOracle
+	case "OptimismMintableERC20Factory":
+		version = c.OptimismMintableERC20Factory
+	case "OptimismPortal":
+		version = c.OptimismPortal
+	case "SystemConfig":
+		version = c.SystemConfig
+	case "ProtocolVersions":
+		version = c.ProtocolVersions
+	case "SuperchainConfig":
+		version = c.SuperchainConfig
+	default:
+		return "", errors.New("no such contract name")
+	}
+	if version == "" {
+		return "", errors.New("no version specified")
+	}
+	return version, nil
 }
 
 // Check will sanity check the validity of the semantic version strings
-// in the ContractVersions struct.
-func (c ContractVersions) Check() error {
+// in the ContractVersions struct. If allowEmptyVersions is true, empty version errors will be ignored.
+func (c ContractVersions) Check(allowEmptyVersions bool) error {
 	val := reflect.ValueOf(c)
 	for i := 0; i < val.NumField(); i++ {
 		field := val.Field(i)
@@ -212,6 +313,9 @@ func (c ContractVersions) Check() error {
 			return fmt.Errorf("invalid type for field %s", val.Type().Field(i).Name)
 		}
 		if str == "" {
+			if allowEmptyVersions {
+				continue // we allow empty strings and rely on tests to assert (or except) a nonempty version
+			}
 			return fmt.Errorf("empty version for field %s", val.Type().Field(i).Name)
 		}
 		str = canonicalizeSemver(str)
@@ -367,6 +471,23 @@ type SuperchainConfig struct {
 	L1   SuperchainL1Info `yaml:"l1"`
 
 	ProtocolVersionsAddr *Address `yaml:"protocol_versions_addr,omitempty"`
+	SuperchainConfigAddr *Address `yaml:"superchain_config_addr,omitempty"`
+
+	// Hardfork Configuration. These values may be overridden by individual chains.
+	hardForkDefaults HardForkConfiguration
+}
+
+// custom unmarshal function to allow yaml to be unmarshalled into unexported fields
+func unMarshalSuperchainConfig(data []byte, s *SuperchainConfig) error {
+	temp := struct {
+		*SuperchainConfig `yaml:",inline"`
+		HardForks         *HardForkConfiguration `yaml:",inline"`
+	}{
+		SuperchainConfig: s,
+		HardForks:        &s.hardForkDefaults,
+	}
+
+	return yaml.Unmarshal(data, temp)
 }
 
 type Superchain struct {
@@ -377,6 +498,14 @@ type Superchain struct {
 
 	// Superchain identifier, without capitalization or display changes.
 	Superchain string
+}
+
+// IsEcotone returns true if the EcotoneTime for this chain in the past.
+func (c *ChainConfig) IsEcotone() bool {
+	if et := c.EcotoneTime; et != nil {
+		return int64(*et) < time.Now().Unix()
+	}
+	return false
 }
 
 var Superchains = map[string]*Superchain{}
@@ -391,115 +520,26 @@ var GenesisSystemConfigs = map[uint64]*GenesisSystemConfig{}
 // to chain by chain id.
 var Implementations = map[uint64]ContractImplementations{}
 
-// SuperchainSemver represents a global mapping of contract name to desired semver version.
-var SuperchainSemver ContractVersions
+// SuperchainSemver maps superchain name to a contract name : approved semver version structure.
+var SuperchainSemver map[string]ContractVersions
 
-func init() {
-	var err error
-	SuperchainSemver, err = newContractVersions()
-	if err != nil {
-		panic(fmt.Errorf("failed to read semver.yaml: %w", err))
-	}
-
-	superchainTargets, err := superchainFS.ReadDir("configs")
-	if err != nil {
-		panic(fmt.Errorf("failed to read superchain dir: %w", err))
-	}
-	// iterate over superchain-target entries
-	for _, s := range superchainTargets {
-		if !s.IsDir() {
-			continue // ignore files, e.g. a readme
-		}
-		// Load superchain-target config
-		superchainConfigData, err := superchainFS.ReadFile(path.Join("configs", s.Name(), "superchain.yaml"))
-		if err != nil {
-			panic(fmt.Errorf("failed to read superchain config: %w", err))
-		}
-		var superchainEntry Superchain
-		if err := yaml.Unmarshal(superchainConfigData, &superchainEntry.Config); err != nil {
-			panic(fmt.Errorf("failed to decode superchain config: %w", err))
-		}
-		superchainEntry.Superchain = s.Name()
-
-		// iterate over the chains of this superchain-target
-		chainEntries, err := superchainFS.ReadDir(path.Join("configs", s.Name()))
-		if err != nil {
-			panic(fmt.Errorf("failed to read superchain dir: %w", err))
-		}
-		for _, c := range chainEntries {
-			if c.IsDir() || !strings.HasSuffix(c.Name(), ".yaml") {
-				continue // ignore files. Chains must be a directory of configs.
-			}
-			if c.Name() == "superchain.yaml" {
-				continue // already processed
-			}
-			// load chain config
-			chainConfigData, err := superchainFS.ReadFile(path.Join("configs", s.Name(), c.Name()))
-			if err != nil {
-				panic(fmt.Errorf("failed to read superchain config %s/%s: %w", s.Name(), c.Name(), err))
-			}
-			var chainConfig ChainConfig
-			if err := yaml.Unmarshal(chainConfigData, &chainConfig); err != nil {
-				panic(fmt.Errorf("failed to decode chain config %s/%s: %w", s.Name(), c.Name(), err))
-			}
-			chainConfig.Chain = strings.TrimSuffix(c.Name(), ".yaml")
-
-			jsonName := chainConfig.Chain + ".json"
-			addressesData, err := extraFS.ReadFile(path.Join("extra", "addresses", s.Name(), jsonName))
-			if err != nil {
-				panic(fmt.Errorf("failed to read addresses data of chain %s/%s: %w", s.Name(), jsonName, err))
-			}
-			var addrs AddressList
-			if err := json.Unmarshal(addressesData, &addrs); err != nil {
-				panic(fmt.Errorf("failed to decode addresses %s/%s: %w", s.Name(), jsonName, err))
-			}
-
-			genesisSysCfgData, err := extraFS.ReadFile(path.Join("extra", "genesis-system-configs", s.Name(), jsonName))
-			if err != nil {
-				panic(fmt.Errorf("failed to read genesis system config data of chain %s/%s: %w", s.Name(), jsonName, err))
-			}
-			var genesisSysCfg GenesisSystemConfig
-			if err := json.Unmarshal(genesisSysCfgData, &genesisSysCfg); err != nil {
-				panic(fmt.Errorf("failed to decode genesis system config %s/%s: %w", s.Name(), jsonName, err))
-			}
-
-			chainConfig.Superchain = s.Name()
-			if other, ok := OPChains[chainConfig.ChainID]; ok {
-				panic(fmt.Errorf("found chain config %q in superchain target %q with chain ID %d "+
-					"conflicts with chain %q in superchain %q and chain ID %d",
-					chainConfig.Name, chainConfig.Superchain, chainConfig.ChainID,
-					other.Name, other.Superchain, other.ChainID))
-			}
-			superchainEntry.ChainIDs = append(superchainEntry.ChainIDs, chainConfig.ChainID)
-			OPChains[chainConfig.ChainID] = &chainConfig
-			Addresses[chainConfig.ChainID] = &addrs
-			GenesisSystemConfigs[chainConfig.ChainID] = &genesisSysCfg
-		}
-
-		Superchains[superchainEntry.Superchain] = &superchainEntry
-
-		implementations, err := newContractImplementations(s.Name())
-		if err != nil {
-			panic(fmt.Errorf("failed to read implementations of superchain target %s: %w", s.Name(), err))
-		}
-
-		Implementations[superchainEntry.Config.L1.ChainID] = implementations
-	}
+func isConfigFile(c fs.DirEntry) bool {
+	return (!c.IsDir() &&
+		strings.HasSuffix(c.Name(), ".yaml") &&
+		c.Name() != "superchain.yaml" &&
+		c.Name() != "semver.yaml")
 }
 
 // newContractVersions will read the contract versions from semver.yaml
 // and check to make sure that it is valid.
-func newContractVersions() (ContractVersions, error) {
+func newContractVersions(superchain string) (ContractVersions, error) {
 	var versions ContractVersions
-	semvers, err := semverFS.ReadFile("semver.yaml")
+	semvers, err := semverFS.ReadFile(path.Join("configs", superchain, "semver.yaml"))
 	if err != nil {
 		return versions, fmt.Errorf("failed to read semver.yaml: %w", err)
 	}
 	if err := yaml.Unmarshal(semvers, &versions); err != nil {
 		return versions, fmt.Errorf("failed to unmarshal semver.yaml: %w", err)
-	}
-	if err := versions.Check(); err != nil {
-		return versions, fmt.Errorf("semver.yaml is invalid: %w", err)
 	}
 	return versions, nil
 }
