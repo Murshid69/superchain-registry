@@ -5,7 +5,7 @@
 
 The Superchain Registry is an index of chains which serves as the source of truth for who’s in the Superchain Ecosystem and what modifications they’ve made to their chains.
 
-## Quickstart
+## start
 
 - ### [👀 See who's in the Superchain Ecosystem](CHAINS.md)
 - ### [⚙️ View detailed config information for each chain](superchain/configs)
